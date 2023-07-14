@@ -62,34 +62,29 @@ spec:
                 # If trace-cmd is already installed, print a message indicating that it's installed
                     echo "trace-cmd is already installed."
                 fi
+
                 ## ================ USER PARAMS ====================== ##
-                DETECTION_INTERVAL_SEC=10   # dump "frequent" statistics once in this interval
-                COLLECTION_INTERVAL_MULT=30 # dump "infrequent" statistics once in (DETECTION_INTERVAL_SEC * this mult)
-                CREDIT_LOG_INTERVAL_MULT=30 # dump credit history to syslog once in (DETECTION_INTERVAL_SEC * this mult)
-                LOW_CREDIT_INSTANCES=12     # consecutive low-credit instances to trigger alert
-                                            # (we want the lowcred condition to last at least 2 minutes)
-                CIFS_INFLIGHT_THRESHOLD=5
-                CIFS_CREDIT_THRESHOLD=200   # cifs "low credit" threshold; we get 212 credits at mount-time.
-                TRACE_CMD_BUFSZ_BYTES=$((16 * 1024 * 1024)) # 16 MB; per-cpu buffer size for trace-cmd
-                DISK_SPACE_GROWTH_FACTOR=2  # (available space / this factor) gives us target logdir size
-                LOGDIR_FILL_ETA_HRS=2       # bail out if we estimate that we will reach target logdir size in this time
                 LOGDIR="/tmp/cc_logs"          # directory in which we collect logs
+                TRACE_CMD_BUFSZ_BYTES=$((16 * 1024 * 1024)) # 16 MB; per-cpu buffer size for trace-cmd
+                CIFS_CREDIT_LOW_WATER_MARK=20
+                CIFS_OTW_MID_MISMATCH_MAX=3
+                DETECTION_INTERVAL_SEC=10   # Dump "frequent" statistics once in this interval
+                COLLECTION_INTERVAL_MULT=30 # Dump "infrequent" statistics once in (DETECTION_INTERVAL_SEC * this mult)
                 ## ========== DO NOT MODIFY BELOW THIS LINE ========== ##
 
-                ##
+                ## == Files that we create/expect ==
                 STOP_COLLECTION_MARKER="/tmp/cifs_credit.stop"
                 INITIAL_INFO="$LOGDIR/initial_system_info"
                 ERR_LOG="$LOGDIR/errors"
-                CRITICAL_TRIGGER_LOG="$LOGDIR/critical_triggers"
                 DEBUGDATA_TMP="$LOGDIR/cifs_debug_data.tmp"
                 DEBUGDATA_OUT="$LOGDIR/cifs_debug_data"
                 CIFS_TRACE_DAT="$LOGDIR/trace.dat"
                 CIFS_TRACE_OUT="$LOGDIR/cifs_trace"
+                CIFS_MID_MISMATCH_LOG="$LOGDIR/cifs_otw_mid_mismatch"
                 STATS_OUT="$LOGDIR/cifs_stats_out"
                 DMESG_OUT="$LOGDIR/cifs_dmesg"
                 CREDIT_HIST="$LOGDIR/cifs_credit_history"
                 UNIQUE_HOSTNAMES="$LOGDIR/unique_sessions_hostnames"
-                MY_PIDFILE="/tmp/cifs_credits_diag.pid"
                 ##
 
                 INITIAL_UPTIME=0
@@ -112,8 +107,9 @@ spec:
                     datestr=$(date -u +'%Y%b%d-%H-%M-%S')
                     tarball_name="$(hostname)_${datestr}_UTC_logs_${LOG_ROTATE_COUNT}.tgz"
                     temp_logdir="${LOGDIR}_${datestr}"
-                    cp -r $LOGDIR "$temp_logdir"
-                    tar czf "/tmp/$tarball_name" $temp_logdir
+                    cp -r $LOGDIR "${temp_logdir}"
+                    echo "Rotate: ${tarball_name}"
+                    tar czf "/tmp/${tarball_name}" $temp_logdir
                     rm -fR $temp_logdir
                     LOG_ROTATE_COUNT=$((LOG_ROTATE_COUNT + 1))
 
@@ -121,7 +117,7 @@ spec:
                     mkdir $LOGDIR;
 
                     #Get rid of tarballs that are older than 3 days
-                    #find /tmp -type f -name "$(hostname)*.tgz" -mtime +3 -exec rm -f {} \;
+                    find /tmp -type f -name "$(hostname)*.tgz" -mtime +3 -exec rm -f {} \;
                 }
 
                 setup_logdir() {
@@ -146,10 +142,11 @@ spec:
 
                     echo 'module cifs +p'   > /sys/kernel/debug/dynamic_debug/control
                     echo 'file fs/cifs* +p' > /sys/kernel/debug/dynamic_debug/control
-                    echo 7 > /proc/fs/cifs/cifsFYI
+                    ## Disabling cifsFYI to avoid polluting syslog
+                    # echo 7 > /proc/fs/cifs/cifsFYI
 
                     trace-cmd reset
-                    trace-cmd start -e cifs
+                    trace-cmd start -e cifs -b TRACE_CMD_BUFSZ_BYTES
                 }
 
                 check_diagcmds_present() {
@@ -235,7 +232,6 @@ spec:
                     trap stop_collection_and_exit SIGINT;
                     trap stop_collection_and_exit SIGURG;
 
-                    echo $$ > $MY_PIDFILE
                     echo "-----------------------------------------------------------------------------"
                     echo "Collecting CIFS credit and related stats ($(date -u +'%Y %b %d %H:%M:%S UTC'))"
                     echo "To stop log collection, please hit Ctrl-C, or run \"kill -9 $$\" as root"
@@ -269,27 +265,90 @@ spec:
                     cat /proc/fs/cifs/DebugData > $DEBUGDATA_TMP
 
                     #
-                    # CIFS DebugData has the credit count on the line _immediately after_ the
-                    # ConnectionId line.  We also want the inflight info.  Stitch the 4 lines
-                    # including the ConnectionId line together, and mark it LOWCRED if the credit
-                    # count is lower than the threshold.
+                    # Check if the no. of requests on the wire matches the MID
+                    # count for a given connection.
                     #
-                    # XXX what we need from debugdata:
-                    #   - ConnectionId, Hostname, Num Credits, Req on Wire, and (empty) list of MIDs that follows the 'MIDs:' line.
+                    # The mid_count needs to be adjusted below because it is
+                    # effectively the number of lines between, and including,
+                    # the `MID:` and the `--` - hence:
                     #
-                    echo "$datestr " >> $CREDIT_HIST
-                    egrep -A3 'ConnectionId' $DEBUGDATA_TMP   |
-                        tr -d '\n'                            |
-                        sed 's/--/\n/g'                       |
-                        awk -v threshold=$CIFS_CREDIT_THRESHOLD \
-                            ' /ConnectionId/ {                  \
-                                if ($9 <= threshold) {          \
-                                    printf "%s LOWCRED\n", $0   \
-                                } else {                        \
-                                    printf "%s\n", $0           \
-                                }} ' >> $CREDIT_HIST
-                    echo >> $CREDIT_HIST
-                    echo "== " >> $CREDIT_HIST
+                    #   (i) The mid_count includes the leading and trailing
+                    #       markers, which should not contribute to the count.
+                    #       We subtract 2 from the count to adjust for this.
+                    #
+                    #   (ii) After subtracting 2 from it, the mid_count is now
+                    #        the number of lines between the starting and
+                    #        ending markers. There are effectively two lines for
+                    #        each MID (every MID line is followed by a blank
+                    #        line) -- so we halve the count.
+                    #
+                    # In addition, log the credit count as well.
+                    #
+                    awk -v cur_date_utc="$(date -u)"                                                  \
+                        -v cifs_credits_lwm="$CIFS_CREDIT_LOW_WATER_MARK"                             \
+                    '                                                                                 \
+                      BEGIN {                                                                         \
+                        conn_id = -1;                                                                 \
+                        srv_hostname = "";                                                            \
+                        requests_on_wire = 0;                                                         \
+                        mid_count = 0;                                                                \
+                        credits = 0;                                                                  \
+                      }                                                                               \
+                                                                                                      \
+                      /^-{51}/ {                                                                      \
+                        next;                                                                         \
+                        # decoration at the top of DebugData                                          \
+                      }                                                                               \
+                                                                                                      \
+                      /^[0-9]+) ConnectionId/ {                                                       \
+                        conn_id = $3;                                                                 \
+                        srv_hostname = $5;                                                            \
+                      }                                                                               \
+                                                                                                      \
+                      /Number of credits/ {                                                           \
+                        credits = $4;                                                                 \
+                      }                                                                               \
+                                                                                                      \
+                      /Req on Wire/ {                                                                 \
+                        otw = $NF;                                                                    \
+                      }                                                                               \
+                                                                                                      \
+                      /MIDs:/,/^--/ {                                                                 \
+                        mid_count++;                                                                  \
+                      }                                                                               \
+                                                                                                      \
+                      /^--/ {                                                                         \
+                        mid_count -= 2;                                                               \
+                        mid_count /= 2;                                                               \
+                                                                                                      \
+                        if (conn_id == -1) {                                                          \
+                          next;                                                                       \
+                        }                                                                             \
+                                                                                                      \
+                        printf("%s %s_%s credits: %d on the wire: %d MID_count: %d",                  \
+                            cur_date_utc,                                                             \
+                            conn_id,                                                                  \
+                            srv_hostname,                                                             \
+                            credits,                                                                  \
+                            requests_on_the_wire,                                                     \
+                            mid_count);                                                               \
+                                                                                                      \
+                        if ((requests_on_wire > 0) && (mid_count == 0)) {                             \
+                          printf(" MID_MISMATCH");                                                    \
+                        }                                                                             \
+                                                                                                      \
+                        if (credits <= cifs_credits_lwm) {                                            \
+                          printf(" LOW_CREDIT");                                                      \
+                        }                                                                             \
+                                                                                                      \
+                        printf("\n");                                                                 \
+                                                                                                      \
+                        requests_on_wire = 0;                                                         \
+                        mid_count = 0;                                                                \
+                        conn_id = -1;                                                                 \
+                        srv_hostname = "";                                                            \
+                      }                                                                               \
+                    ' $DEBUGDATA_TMP >> $CREDIT_HIST
                     rm -f $DEBUGDATA_TMP
 
                     collect_infrequent_stats_trigger=$((wcnt % COLLECTION_INTERVAL_MULT))
@@ -297,114 +356,73 @@ spec:
                     then
                         collect_infrequent_stats
                     fi
-
-                    log_credit_score_trigger=$((wcnt % CREDIT_LOG_INTERVAL_MULT))
-                    if (( $log_credit_score_trigger == 0 ))
-                    then
-                        # extract session id, mountpoint, credit score, and inflight requests.
-                        # log these to syslog.
-                        egrep -A3 'ConnectionId' /proc/fs/cifs/DebugData    |
-                            tr -d '\n'                                      |
-                            sed 's/--/\n/g' > $DEBUGDATA_TMP
-                        echo >> $DEBUGDATA_TMP
-
-                        while read cr_log_line; do
-                            logger -p local0.warning "CIFS_CREDIT_LOG: $datestr $cr_log_line"
-                        done<$DEBUGDATA_TMP
-                    fi
-                    rm -f $DEBUGDATA_TMP
-
                 }
 
 
                 check_trigger_conditions() {
-                    local low_credit_count;
-                    local zero_credit_count;
+                    # ===
+                    # Check to see if:
                     #
-                    # === Check to see if the credit count is below 20, 3 times in a row ===
+                    # (1) There is a mismatch between the inflight request count
+                    # and the no. of MIDs inflight, enough times in a row,
                     #
-                    # Note that any instance of credit < 20 is marked LOWCRED in collect_stats.
-                    # Create a list of unique (session_id, hostname) tuples, store each tuple
-                    # as a regexp in the $UNIQUE_HOSTNAMES file.
+                    # _OR_
                     #
-                    awk '/ConnectionId/ {printf("%s.*%s\n", $3, $5)}' $CREDIT_HIST  |
-                        sort  |
-                        uniq  > $UNIQUE_HOSTNAMES;
-
+                    # (2) The credit count goes below a certain threshold, and
+                    # stays low, enough times in a row
                     #
-                    #  For each (session_id, hostname), look at the last $LOW_CREDIT_INSTANCES
-                    #  entries in the credit history; if all of them are marked LOWCRED, stop
-                    #  log collection and generate the tarball.
-                    #
+                    # ===
                     local logs_need_rotation=0
-                    while read hostsession; do
-                        #lowcred_count=$(egrep $hostsession $CREDIT_HIST|
-                        #               tail -n $LOW_CREDIT_INSTANCES   |
-                        #               egrep -c 'LOWCRED')
 
-                        #
-                        # make sure that we see LOWCRED, as well as $(NF - 1) <= 2
-                        # $(NF - 1) is _coincidentally_ the inflight request count.
-                        #
-                        # XXX - check the inflight count and compare it with the
-                        #       number of MIDs in the MID list from debugdata?
-                        #
-                        low_credit_count=$(egrep $hostsession $CREDIT_HIST  |
-                                        tail -n $LOW_CREDIT_INSTANCES       |
-                                        awk -v if_threshold=$CIFS_INFLIGHT_THRESHOLD    \
-                                        'BEGIN {                                        \
-                                            lowcred_count=0;                            \
-                                        }                                               \
-                                        ($(NF-1) <= if_threshold) && /LOWCRED/ {        \
-                                            lowcred_count++;                            \
-                                        }                                               \
-                                        END {                                           \
-                                            printf "%d\n", lowcred_count;               \
-                                        }'                                              \
-                        );
+                    # check for consecutive occurrences
+                    awk -v mid_mismatch_threshold="$CIFS_OTW_MID_MISMATCH_MAX" \
+                        -v low_credit_threshold="$CIFS_CREDIT_LOW_WATER_MARK"  \
+                    ' BEGIN {                                                  \
+                          delete mid_mismatch_count[0];                        \
+                          delete low_credit_count[0];                          \
+                      }                                                        \
+                                                                               \
+                      /MID_MISMATCH/ {                                         \
+                          mid_mismatch_count[$7]++;                            \
+                          for (hs in mid_mismatch_count) {                     \
+                            if (mid_mismatch_count[hs] > mid_mismatch_threshold) { \
+                              printf("MID MISMATCH FOUND: %s\n", $0);          \
+                            }                                                  \
+                          }                                                    \
+                      }                                                        \
+                                                                               \
+                      !/MID_MISMATCH/ {                                        \
+                          mid_mismatch_count[$7] = 0;                          \
+                      }                                                        \
+                                                                               \
+                      /LOW_CREDIT/ {                                           \
+                          low_credit_count[$7]++;                              \
+                          for (hs in low_credit_count) {                       \
+                            if (low_credit_count[hs] <= low_credit_threshold) {\
+                              printf("LOW CREDIT FOUND: %s\n", $0);            \
+                            }                                                  \
+                          }                                                    \
+                      }                                                        \
+                                                                               \
+                      !/LOW_CREDIT/ {                                          \
+                          low_credit_count[$7] = 0;                            \
+                      }
+                    ' $CREDIT_HIST >> $CIFS_MID_MISMATCH_LOG
 
-                        if (( low_credit_count == LOW_CREDIT_INSTANCES ))
-                        then
-                            echo "--> Low credit situation found on $hostsession <--"
-                            #
-                            # do _not_ stop log collection, fire off an alert to syslog,
-                            # rotate logs, and _continue_ until we hit the termination condition.
-                            #
-                            logs_need_rotation=1
-                            logger -p local0.warning "CIFS_CREDIT_ALERT: low credit on $hostsession"
-                        fi
+                    #XXX fix up the error message properly
+                    if [[ ! -z $CIFS_MID_MISMATCH_LOG ]];
+                    then
+                      logs_need_rotation=1
+                      logger -p local0.warning "CIFS_CREDIT_ALERT: MID count mismatch on $hostsession"
 
-                        #
-                        # The "termination check" is (inflight <= 2) && (credit == 0)
-                        #
-                        zero_cred_count=$(egrep $hostsession $CREDIT_HIST   |
-                            tail -n $LOW_CREDIT_INSTANCES                   |
-                            awk 'BEGIN {                        \
-                                    zero_cred_count=0;          \
-                            }                                   \
-                            ($(NF-1) <= 2) && ($9 == 0) {       \
-                                zero_cred_count++;              \
-                            }                                   \
-                            END {                               \
-                                printf "%d\n", zero_cred_count; \
-                            }'                                  \
-                         );
-
-                        if (( zero_cred_count == LOW_CREDIT_INSTANCES )); then
-                            logger -p local0.alert "CIFS_CREDIT_LOG: stopping log collection"
-                            echo "--> HIT CRITICAL TRIGGER at $(date) -- BUT CONTINUING" >> $CRITICAL_TRIGGER_LOG
-                            logs_need_rotation=1
-
-                            # We keep running even if we hit the termination condition
-                            #echo "--> Stopping log collection"
-                            #teardown
-                            #exit 1
-                        fi
-                    done<$UNIQUE_HOSTNAMES
+                      echo "--> Stopping log collection"
+                      teardown
+                      exit 1
+                    fi
 
                     if ((logs_need_rotation == 1)); then
-                        logs_need_rotation=0;
                         rotate_logdir
+                        logs_need_rotation=0;
                     fi
                 }
 
@@ -468,15 +486,15 @@ spec:
                     tar czf "/tmp/$tarball_name" $LOGDIR
 
                     composite_tarball_name="COMPOSITE_${cur_tarball_prefix}.tgz"
-                    tar czf "/tmp/$composite_tarball_name" /tmp/*.tgz "$LOGDIR"
+                    tar czf "/tmp/$composite_tarball_name" "/tmp/$(hostname)_*.tgz" "$LOGDIR"
                     echo ""
                     echo "==> Created composite tarball $composite_tarball_name"
                     echo "Please send a copy of this tarball to Microsoft support for further analysis"
                     echo "-----------------------------------------------------------------------------"
-                    rm -f ./$(hostname)_*
+                    rm -f "/tmp/$(hostname)*"
 
                     if [[ -d $LOGDIR ]]; then
-                         rm -fR $LOGDIR
+                      rm -fR $LOGDIR
                     fi
                 }
 
