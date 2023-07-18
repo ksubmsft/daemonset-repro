@@ -12,20 +12,11 @@ spec:
       labels:
         name: cifs-credits-diag
     spec:
+      nodeSelector:
+        kubernetes.azure.com/mode: user
       containers:
         - name: cifs-credits-diag
           image: alpine:latest
-          livenessProbe:
-            exec:
-              command:
-              - bash
-              - -c
-              - |
-                  disk_usage=$(df -h / | awk '{print $5}' | tail -n 1)
-                  disk_usage_percent=${disk_usage%%%}
-                  if [[ $disk_usage_percent > 50 ]]; then exit 199; fi
-            initialDelaySeconds: 5
-            periodSeconds: 10
           lifecycle:
             preStop:
               exec:
@@ -43,6 +34,13 @@ spec:
             - -c
             - |
                 #!/bin/bash
+                cifs_mod_count=$(lsmod |egrep -c cifs)
+                if ! (( cifs_mod_count > 0 ));
+                then
+                  echo "[$(hostname)] cifs.ko not loaded, exiting";
+                  exit;
+                fi
+
                 if ! command -v trace-cmd &> /dev/null;
                 then
                  # If trace-cmd is not installed, attempt to install it
@@ -64,10 +62,12 @@ spec:
                 fi
 
                 ## ================ USER PARAMS ====================== ##
-                LOGDIR="/tmp/cc_logs"          # directory in which we collect logs
+                LOGDIR="/tmp/cc_logs"         # directory in which we collect logs
+                DISK_USAGE_THRESHOLD_PERC=70  # bail out if the filesystem on which the LOGDIR is present grows beyond this limit
                 TRACE_CMD_BUFSZ_BYTES=$((16 * 1024 * 1024)) # 16 MB; per-cpu buffer size for trace-cmd
                 CIFS_CREDIT_LOW_WATER_MARK=20
-                CIFS_OTW_MID_MISMATCH_MAX=3
+                CIFS_OTW_MID_MISMATCH_MAX=3   # Max occurrences of MID/on-the-wire mismatch for detection
+                CIFS_LOW_CREDIT_MAX=10        # Max occurrences of low credit for detection
                 DETECTION_INTERVAL_SEC=10   # Dump "frequent" statistics once in this interval
                 COLLECTION_INTERVAL_MULT=30 # Dump "infrequent" statistics once in (DETECTION_INTERVAL_SEC * this mult)
                 ## ========== DO NOT MODIFY BELOW THIS LINE ========== ##
@@ -140,9 +140,9 @@ spec:
                     # In any case, they should've been flushed down to /var/log/(kern.log|messages).
                     dmesg -c -T > /dev/null
 
-                    echo 'module cifs +p'   > /sys/kernel/debug/dynamic_debug/control
-                    echo 'file fs/cifs* +p' > /sys/kernel/debug/dynamic_debug/control
-                    ## Disabling cifsFYI to avoid polluting syslog
+                    ## Disabling cifsFYI and debug logs to avoid polluting syslog
+                    #echo 'module cifs +p'   > /sys/kernel/debug/dynamic_debug/control
+                    #echo 'file fs/cifs* +p' > /sys/kernel/debug/dynamic_debug/control
                     # echo 7 > /proc/fs/cifs/cifsFYI
 
                     trace-cmd reset
@@ -158,49 +158,12 @@ spec:
                 }
 
                 check_space_consumption() {
-                    # Set the number of measurements to keep for calculating growth rate
-                    num_measurements=10
-                    # Get the initial size of the root filesystem
-                    initial_size=$(df -h / | awk 'NR==2{print $3}')
-
-                    # Initialize an array to hold the previous measurements
-                    measurements=($initial_size)
-
-                    # Loop until the root filesystem utilization is at or above 50%
-                    # while true; do
-                    # Wait for the specified interval
-                    #   sleep $interval
-
-                    # Get the current size of the root filesystem
-                    current_size=$(df -h / | awk 'NR==2{print $3}')
-
-                    # Calculate the growth rate over the last 10 minutes
-                    num_measurements=${#measurements[@]}
-                    if (( num_measurements < 2 )); then
-                          growth_rate="N/A"
-                    else
-                          growth=$((${measurements[$num_measurements-1]} - ${measurements[$num_measurements-2]}))
-                          growth_rate=$(echo "scale=2; $growth/$interval" | bc)
-                          growth_rate="$growth_rate MB/s"
-                    fi
-
-                    # Write the current size and growth rate to a file
-                    echo "$(date '+%Y-%m-%d %H:%M:%S'),$current_size,$growth_rate" >> disk_usage.csv
-
-                    # Check if the root filesystem utilization is above 50%
-                    usage=$(df -h / | awk 'NR==2{print $5}' | sed 's/%//')
-                    if (( usage >= 50 )); then
-                          echo "Error: Root filesystem utilization is above 50%. Stopping script."
+                    # Check if the filesystem utilization is above the threshold
+                    usage=$(df -k "$LOGDIR" | awk '(NR==2 && $1 ~ /\/dev\/.*/) {print $5}' | sed 's/%//')
+                    if (( usage >= $DISK_USAGE_THRESHOLD_PERC )); then
+                          echo "Error: filesystem utilization is ${usage}%. Stopping script."
                           exit 198
                     fi
-
-                    # Add the current measurement to the array
-                    measurements+=($current_size)
-                    # Remove the oldest measurement if the array has reached its maximum size
-                    if (( ${#measurements[@]} > $num_measurements )); then
-                          measurements=("${measurements[@]:1}")
-                    fi
-                    #done
                 }
 
                 collect_initial_info() {
@@ -270,7 +233,7 @@ spec:
                     #
                     # The mid_count needs to be adjusted below because it is
                     # effectively the number of lines between, and including,
-                    # the `MID:` and the `--` - hence:
+                    # the `MID:` and the `--`;
                     #
                     #   (i) The mid_count includes the leading and trailing
                     #       markers, which should not contribute to the count.
@@ -303,14 +266,17 @@ spec:
                       /^[0-9]+) ConnectionId/ {                                                       \
                         conn_id = $3;                                                                 \
                         srv_hostname = $5;                                                            \
+                        next;                                                                         \
                       }                                                                               \
                                                                                                       \
                       /Number of credits/ {                                                           \
                         credits = $4;                                                                 \
+                        next;                                                                         \
                       }                                                                               \
                                                                                                       \
                       /Req on Wire/ {                                                                 \
                         otw = $NF;                                                                    \
+                        next;                                                                         \
                       }                                                                               \
                                                                                                       \
                       /MIDs:/,/^--/ {                                                                 \
@@ -323,31 +289,31 @@ spec:
                                                                                                       \
                         if (conn_id == -1) {                                                          \
                           next;                                                                       \
-                        }                                                                             \
-                                                                                                      \
-                        printf("%s %s_%s credits: %d on the wire: %d MID_count: %d",                  \
-                            cur_date_utc,                                                             \
-                            conn_id,                                                                  \
-                            srv_hostname,                                                             \
-                            credits,                                                                  \
-                            requests_on_the_wire,                                                     \
-                            mid_count);                                                               \
-                                                                                                      \
-                        if ((requests_on_wire > 0) && (mid_count == 0)) {                             \
-                          printf(" MID_MISMATCH");                                                    \
-                        }                                                                             \
-                                                                                                      \
-                        if (credits <= cifs_credits_lwm) {                                            \
-                          printf(" LOW_CREDIT");                                                      \
-                        }                                                                             \
-                                                                                                      \
-                        printf("\n");                                                                 \
-                                                                                                      \
-                        requests_on_wire = 0;                                                         \
-                        mid_count = 0;                                                                \
-                        conn_id = -1;                                                                 \
-                        srv_hostname = "";                                                            \
                       }                                                                               \
+                                                                                                      \
+                      printf("%s %s_%s credits: %d on the wire: %d MID_count: %d",                    \
+                        cur_date_utc,                                                                 \
+                        conn_id,                                                                      \
+                        srv_hostname,                                                                 \
+                        credits,                                                                      \
+                        requests_on_the_wire,                                                         \
+                        mid_count);                                                                   \
+                                                                                                      \
+                      if ((requests_on_wire > 0) && (mid_count == 0)) {                               \
+                        printf(" MID_MISMATCH");                                                      \
+                      }                                                                               \
+                                                                                                      \
+                      if (credits <= cifs_credits_lwm) {                                              \
+                        printf(" LOW_CREDIT");                                                        \
+                      }                                                                               \
+                                                                                                      \
+                      printf("\n");                                                                   \
+                                                                                                      \
+                      requests_on_wire = 0;                                                           \
+                      mid_count = 0;                                                                  \
+                      conn_id = -1;                                                                   \
+                      srv_hostname = "";                                                              \
+                    }                                                                                 \
                     ' $DEBUGDATA_TMP >> $CREDIT_HIST
                     rm -f $DEBUGDATA_TMP
 
@@ -361,31 +327,30 @@ spec:
 
                 check_trigger_conditions() {
                     # ===
-                    # Check to see if:
-                    #
-                    # (1) There is a mismatch between the inflight request count
-                    # and the no. of MIDs inflight, enough times in a row,
-                    #
-                    # _OR_
-                    #
-                    # (2) The credit count goes below a certain threshold, and
-                    # stays low, enough times in a row
-                    #
+                    # Check to see if there is a mismatch between the inflight
+                    # request count and the no. of MIDs inflight, enough times
+                    # in a row. If yes, exit.
                     # ===
+
                     local logs_need_rotation=0
 
-                    # check for consecutive occurrences
-                    awk -v mid_mismatch_threshold="$CIFS_OTW_MID_MISMATCH_MAX" \
-                        -v low_credit_threshold="$CIFS_CREDIT_LOW_WATER_MARK"  \
+                    awk -v mid_mismatch_max_count="$CIFS_OTW_MID_MISMATCH_MAX" \
+                        -v low_credit_max_count="$CIFS_LOW_CREDIT_MAX"  \
                     ' BEGIN {                                                  \
                           delete mid_mismatch_count[0];                        \
                           delete low_credit_count[0];                          \
                       }                                                        \
                                                                                \
+                      #                                                        \
+                      # The 7th field in the credit history log is the         \
+                      # {session_id}_{hostname} tuple.                         \
+                      # We know this to be true because we generate the credit \
+                      # history log in collect_stats() above.                  \
+                      #                                                        \
                       /MID_MISMATCH/ {                                         \
                           mid_mismatch_count[$7]++;                            \
                           for (hs in mid_mismatch_count) {                     \
-                            if (mid_mismatch_count[hs] > mid_mismatch_threshold) { \
+                            if (mid_mismatch_count[hs] >= mid_mismatch_max_count) { \
                               printf("MID MISMATCH FOUND: %s\n", $0);          \
                             }                                                  \
                           }                                                    \
@@ -398,7 +363,7 @@ spec:
                       /LOW_CREDIT/ {                                           \
                           low_credit_count[$7]++;                              \
                           for (hs in low_credit_count) {                       \
-                            if (low_credit_count[hs] <= low_credit_threshold) {\
+                            if (low_credit_count[hs] >= low_credit_max_count) {\
                               printf("LOW CREDIT FOUND: %s\n", $0);            \
                             }                                                  \
                           }                                                    \
@@ -409,11 +374,11 @@ spec:
                       }
                     ' $CREDIT_HIST >> $CIFS_MID_MISMATCH_LOG
 
-                    #XXX fix up the error message properly
-                    if [[ ! -z $CIFS_MID_MISMATCH_LOG ]];
+                    trigger_count=$(egrep -c 'MID MISMATCH FOUND' "$CIFS_MID_MISMATCH_LOG")
+                    if (( trigger_count > 0 ))
                     then
                       logs_need_rotation=1
-                      logger -p local0.warning "CIFS_CREDIT_ALERT: MID count mismatch on $hostsession"
+                      logger -p local0.warning "CIFS_CREDIT_ALERT: MID mismatch/Low credit on $hostsession"
 
                       echo "--> Stopping log collection"
                       teardown
@@ -486,7 +451,7 @@ spec:
                     tar czf "/tmp/$tarball_name" $LOGDIR
 
                     composite_tarball_name="COMPOSITE_${cur_tarball_prefix}.tgz"
-                    tar czf "/tmp/$composite_tarball_name" "/tmp/$(hostname)_*.tgz" "$LOGDIR"
+                    tar czf "/tmp/$composite_tarball_name" "/tmp/$(hostname)_*.tgz" "$LOGDIR" --ignore-failed-read
                     echo ""
                     echo "==> Created composite tarball $composite_tarball_name"
                     echo "Please send a copy of this tarball to Microsoft support for further analysis"
