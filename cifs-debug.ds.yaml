@@ -38,7 +38,7 @@ spec:
                 if ! (( cifs_mod_count > 0 ));
                 then
                   echo "[$(hostname)] cifs.ko not loaded, exiting";
-                  exit;
+                  exit 0;
                 fi
 
                 if ! command -v trace-cmd &> /dev/null;
@@ -131,7 +131,7 @@ spec:
                     local err="$?"
                     if [[ $err != 0 ]]; then
                         echo "Error creating logdir: $err" |tee $ERR_LOG
-                        exit 1
+                        exit 0
                     fi
                 }
 
@@ -378,11 +378,12 @@ spec:
                     if (( trigger_count > 0 ))
                     then
                       logs_need_rotation=1
+                      echo "==> [ $(date -u) ] CIFS_CREDIT_ALERT: MID mismatch/Low credit on $hostsession"
                       logger -p local0.warning "CIFS_CREDIT_ALERT: MID mismatch/Low credit on $hostsession"
+                      echo "==> [ $(date -u) ] Hit trigger condition; Stopping log collection"
 
-                      echo "--> Stopping log collection"
                       teardown
-                      exit 1
+                      exit 0
                     fi
 
                     if ((logs_need_rotation == 1)); then
@@ -465,11 +466,22 @@ spec:
 
                 main() {
                     am_i_root
+
+                    composite_log_count=$(ls /tmp/*.tgz |egrep -c "COMPOSITE_$(hostname)")
+                    while (( composite_log_count > 0 ));
+                    do
+                        echo "==> SMB trigger hit. Please send /tmp/COMPOSITE_$(hostname)_*.tgz to Microsoft Support."
+                        echo "==> This message will continue to be printed as long as the /tmp/COMPOSITE_$(hostname)_*.tgz files exist."
+                        sleep 60;
+                        composite_log_count=$(ls /tmp/*.tgz |egrep -c "COMPOSITE_$(hostname)")
+                    done
+
                     setup
 
                     collect_periodic_stats
 
                     teardown
+                    exit 0
                 }
 
                 main
