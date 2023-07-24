@@ -74,6 +74,7 @@ spec:
 
                 ## == Files that we create/expect ==
                 STOP_COLLECTION_MARKER="/tmp/cifs_credit.stop"
+                TRIGGER_HIT_MARKER="/tmp/cifs_credit_trigger_hit"
                 INITIAL_INFO="$LOGDIR/initial_system_info"
                 ERR_LOG="$LOGDIR/errors"
                 DEBUGDATA_TMP="$LOGDIR/cifs_debug_data.tmp"
@@ -197,7 +198,7 @@ spec:
 
                     echo "-----------------------------------------------------------------------------"
                     echo "Collecting CIFS credit and related stats ($(date -u +'%Y %b %d %H:%M:%S UTC'))"
-                    echo "To stop log collection, please hit Ctrl-C, or run \"kill -9 $$\" as root"
+                    echo "To stop log collection, please hit Ctrl-C, or run kill -9 $$ as root"
                     echo "-----------------------------------------------------------------------------"
                 }
 
@@ -381,6 +382,7 @@ spec:
                       echo "==> [ $(date -u) ] CIFS_CREDIT_ALERT: MID mismatch/Low credit on $hostsession"
                       logger -p local0.warning "CIFS_CREDIT_ALERT: MID mismatch/Low credit on $hostsession"
                       echo "==> [ $(date -u) ] Hit trigger condition; Stopping log collection"
+                      echo "date -u" > "$TRIGGER_HIT_MARKER"
 
                       teardown
                       exit 0
@@ -467,14 +469,27 @@ spec:
                 main() {
                     am_i_root
 
+                    #
+                    # The $TRIGGER_HIT_MARKER file is created only when we hit
+                    # the trigger condition. If the trigger hit marker is
+                    # present, and there's also a tarball, we do not proceed
+                    # further. When we do proceed further, we remove the trigger
+                    # hit marker file.
+                    #
                     composite_log_count=$(ls /tmp/*.tgz |egrep -c "COMPOSITE_$(hostname)")
-                    while (( composite_log_count > 0 ));
+                    while [[ -f $TRIGGER_HIT_MARKER && composite_log_count -gt 0 ]];
                     do
-                        echo "==> SMB trigger hit. Please send /tmp/COMPOSITE_$(hostname)_*.tgz to Microsoft Support."
-                        echo "==> This message will continue to be printed as long as the /tmp/COMPOSITE_$(hostname)_*.tgz files exist."
-                        sleep 60;
-                        composite_log_count=$(ls /tmp/*.tgz |egrep -c "COMPOSITE_$(hostname)")
+                      local trigger_hit_date=$(cat $TRIGGER_HIT_MARKER)
+                      echo "==> SMB credit trigger hit at $trigger_hit_date. Please send /tmp/COMPOSITE_$(hostname)_*.tgz to Microsoft Support, and "
+                      echo "==> This message will continue to be printed as long as the /tmp/COMPOSITE_$(hostname)_*.tgz files exist."
+                      sleep 60;
+                      composite_log_count=$(ls /tmp/*.tgz |egrep -c "COMPOSITE_$(hostname)")
                     done
+
+                    if [[ -f $TRIGGER_HIT_MARKER ]];
+                    then
+                      rm -f $TRIGGER_HIT_MARKER;
+                    fi
 
                     setup
 
